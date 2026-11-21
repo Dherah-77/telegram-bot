@@ -86,6 +86,8 @@ export const DEAD_LETTER_MAX_ATTEMPTS = 10;
 const ERROR_TRUNCATE = 200;
 /** Telegram's own message ceiling (4,096) minus room for the queue's own text. */
 const TEXT_TRUNCATE = 4_000;
+const SOURCE_TRUNCATE = 32;
+const EVENT_NAME_TRUNCATE = 80;
 const CORRELATION_ID_PATTERN = /^evt_[0-9a-f]{24}$/;
 
 function validCorrelationId(value: unknown): string | undefined {
@@ -99,6 +101,11 @@ function correlationLabel(correlationId: string | undefined): string {
 function truncate(value: string, max: number): string {
   if (value.length <= max) return value;
   return `${value.slice(0, max)}…`;
+}
+
+function truncateLabel(value: string, max: number): string {
+  if (value.length <= max) return value;
+  return `${value.slice(0, max - 1)}…`;
 }
 
 /** Short non-crypto fingerprint so duplicate failures collapse into one entry. */
@@ -179,13 +186,17 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
               id: e.id,
               enqueuedAt:
                 typeof e.enqueuedAt === "string" ? e.enqueuedAt : new Date(now()).toISOString(),
-              source: typeof e.source === "string" ? e.source : "unknown",
+              source: typeof e.source === "string"
+                ? truncateLabel(e.source, SOURCE_TRUNCATE)
+                : "unknown",
               ledger: e.ledger,
-              eventName: typeof e.eventName === "string" ? e.eventName : "unknown",
+              eventName: typeof e.eventName === "string"
+                ? truncateLabel(e.eventName, EVENT_NAME_TRUNCATE)
+                : "unknown",
               ...(correlationId ? { correlationId } : {}),
               text: truncate(e.text, TEXT_TRUNCATE),
               attempts: typeof e.attempts === "number" && e.attempts >= 0 ? e.attempts : 0,
-              lastError: typeof e.lastError === "string" ? truncate(e.lastError, ERROR_TRUNCATE) : null,
+              lastError: typeof e.lastError === "string" ? safeError(e.lastError) : null,
             };
           });
         // Bound on load too: the file may have been edited by hand.
