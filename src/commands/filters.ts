@@ -204,22 +204,6 @@ export function filtersMessage(config: FiltersConfig = {}): string {
     lines.push(`· Per\\-chat routes: none \\(using global default, ${globalPreview}\\)`);
   }
 
-  // Digest Scheduling (per chat)
-  const digestChatIds = Object.keys(digestPreferences);
-  if (digestChatIds.length > 0) {
-    lines.push("");
-    lines.push("*Digest Schedule*");
-    for (const chatId of digestChatIds) {
-      const pref = digestPreferences[chatId];
-      const error = validateDigestInterval(pref.intervalMinutes);
-      const label = error
-        ? `invalid \\(${escapeMd(error)}\\)`
-        : `every ${pref.intervalMinutes} min`;
-      lines.push(`· \`${escapeMd(redactChatId(chatId))}\`: ${label}`);
-    }
-    lines.push("· Critical notifications are delivered immediately and are not batched");
-  }
-
   return lines.join("\n");
 }
 

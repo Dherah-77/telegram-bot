@@ -58,7 +58,7 @@ export function validateCommandCatalogue(options?: CommandConsistencyOptions): v
 }
 
 export {
-  commandMenus,
+  commandAvailabilityReport,
   commandMetadata,
   commandModule,
   defineCommand,

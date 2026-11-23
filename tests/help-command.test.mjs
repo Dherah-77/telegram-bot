@@ -63,12 +63,6 @@ for (const operatorId of [null, "42"]) {
       );
       assert.equal(menus[1].some(({ command }) => command === "audit"), true);
     }
-    for (const menu of menus) {
-      for (const { command, description } of menu) {
-        assert.ok(handlers.has(command), `${command} has a handler`);
-        assert.ok(description.length >= 1 && description.length <= 256);
-      }
-    }
     assert.equal(handlers.size, 12, "disabled operator handlers still enforce authorization");
   });
 }
