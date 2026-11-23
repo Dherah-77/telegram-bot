@@ -1,5 +1,12 @@
 import type { DecodedEvent } from "./decode.js";
 import { eventHistogram, scanJsonReplacer } from "./events.js";
+import { validateLedgerRange, type LedgerRange } from "./ledger-range.js";
+
+/** Default maximum byte length of a single JSONL record (excluding line ending). */
+export const DEFAULT_MAX_JSONL_LINE_BYTES = 64 * 1024; // 64 KiB
+
+/** Default chunk size in bytes when streaming JSONL files from disk. */
+export const DEFAULT_JSONL_CHUNK_BYTES = 64 * 1024; // 64 KiB
 
 export const ARCHIVE_SCHEMA_FORMAT = "mimir-event-archive" as const;
 export const SCAN_JSONL_SCHEMA_FORMAT = "mimir-scan-jsonl" as const;
