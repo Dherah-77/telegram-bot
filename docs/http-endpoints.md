@@ -22,7 +22,8 @@ with health checks.
 Because both listeners bind `127.0.0.1` by default, any client on the same
 host can read them. If you deploy on a platform that routes probes from a
 different host (container network, Kubernetes pod network, Railway health
-checker) you must change the bind address:
+checker) you must change the bind address. The optional `/atom` route is served
+by the health listener and inherits the same bind and bearer-token rules.
 
 ```dotenv
 HEALTH_HOST=0.0.0.0   # reachable from any interface
@@ -33,6 +34,11 @@ Never set `HEALTH_HOST=0.0.0.0` without a firewall rule or network policy
 that restricts who can reach the port. The health response includes
 configuration provenance (which env var supplied each setting) and poller
 counters. It contains no secrets, but it does confirm what is running.
+
+All operational HTTP responses on both listeners — including health, readiness,
+liveness, metrics, unauthorized (`401`), and error (`404`/`405`) responses —
+set `Cache-Control: no-store` so reverse proxies and intermediaries never cache
+live operational state.
 
 ---
 
@@ -50,9 +56,12 @@ Never returns a non-200.
   "service": "mimir-telegram-bot",
   "health": "/health",
   "live": "/health/live",
-  "metrics": "/metrics"
+  "metrics": "/metrics",
+  "atom": "/atom"
 }
 ```
+
+`atom` appears only when `ATOM_FEED_ENABLED=true`.
 
 ```bash
 curl -s http://127.0.0.1:8787/
@@ -72,13 +81,15 @@ response fields is backward-compatible with v1; removing or renaming a v1 field,
 changing its type, or changing a fixed enum requires a new contract version.
 The v1 fixture remains the compatibility baseline for future response shapes.
 
-| Condition | `status` | `ok` | HTTP |
-|---|---|---|---|
-| Poller running, recent successful poll | `"ok"` | `true` | 200 |
-| Poller running but paused by operator | `"ok"` | `true` | 200 |
-| Poller draining (graceful shutdown) | `"ok"` | `true` | 200 |
-| Too many consecutive failures, stale, stale/stalled cursor | `"degraded"` | `false` | 503 |
-| Poller not running | `"stopped"` | `false` | 503 |
+| Condition | `status` | `ok` | `ready` | HTTP |
+|---|---|---|---|---|
+| Poller running, recent successful poll | `"ok"` | `true` | `true` | 200 |
+| Poller running but paused by operator | `"ok"` | `true` | `true` | 200 |
+| Poller draining (graceful shutdown) | `"ok"` | `true` | `false` | 503 |
+| Too many consecutive failures, stale, stale/stalled cursor | `"degraded"` | `false` | `false` | 503 |
+| Poller not running | `"stopped"` | `false` | `false` | 503 |
+
+During graceful shutdown, the health server transitions readiness to `false` (HTTP `503`) and stops accepting operational HTTP work (such as webhook deliveries) before polling stops and before the HTTP server closes, while `GET /health/live` (and `GET /livez`) continues returning HTTP `200` until the server closes.
 
 **Response body fields**
 
@@ -145,6 +156,28 @@ The v1 fixture remains the compatibility baseline for future response shapes.
     "persistentVolumeAvailable": true,
     "persistentVolumeError": null
   },
+  "dependencies": {
+    // Per-dependency readiness: *why* the bot is not ready, separated into the
+    // four dependencies it relies on. Additive; the overall ok/status above are
+    // unchanged. Every reason is counts + public source names only — never a
+    // token, a chat id, or another private destination identifier.
+    "rpc": {
+      "ready": true,                    // Stellar RPC reachability
+      "reason": null                    // value-free reason, or null when ready
+    },
+    "cursor": {
+      "ready": true,                    // cursor / resume-position usability
+      "reason": null
+    },
+    "route": {
+      "ready": true,                    // a destination is configured per contract
+      "reason": null                    // names the source (market/squad), never the chat id
+    },
+    "delivery": {
+      "ready": true,                    // sends are landing (dead-letter queue empty)
+      "reason": null
+    }
+  },
   "config": {
     // Key names and their source (env var name, default, etc.). No values.
     "BOT_TOKEN": { "source": "env" },
@@ -152,6 +185,43 @@ The v1 fixture remains the compatibility baseline for future response shapes.
     // … one entry per recognised config key
   }
 }
+```
+
+#### Dependency readiness (`dependencies`)
+
+The `dependencies` object separates *why* the bot is not ready into the four
+dependencies it relies on, so a probe or dashboard can name the bottleneck
+rather than only seeing `status: "degraded"`. It is additive detail: the
+overall `ok` / `status` (and HTTP status code) are unchanged.
+
+| Dependency | Ready when | Not-ready reason (value-free) |
+|---|---|---|
+| `rpc` | RPC is reachable and polls are fresh | `circuit breaker open after N consecutive RPC failures`, `consecutive failures (N) exceed budget (M)`, `no successful poll within <healthStaleMs> ms` |
+| `cursor` | Every watched target's cursor is usable | `stale cursor on market`, `stalled cursor on squad`, or both joined by `;` |
+| `route` | A destination is configured for each watched contract | `no destination configured for market, squad` (names the source, never the chat id) |
+| `delivery` | No sends are parked in the dead-letter queue | `N send(s) awaiting replay in the dead-letter queue` |
+
+`rpc` and `cursor` reuse the same signals that drive the `"degraded"` verdict
+and are suppressed during an intentional operator pause or graceful drain
+(consistent with `status` staying `"ok"` for those states). `route` is
+config-derived and independent of poller state. `delivery` follows the
+dead-letter queue depth and is reported whenever the poller is running, since
+a backlog persists across a pause or drain. When the poller is stopped,
+`rpc`, `cursor` and `delivery` report `poller not running`; `route` still
+reflects configuration.
+
+Every reason is built from counts and public source names (`market`/`squad`)
+only. No token, chat id, or other private destination identifier is ever
+included — the route reason names *which* source lacks a destination, never
+*what* that destination is.
+
+```bash
+# Which dependency is the bottleneck when degraded
+curl -s http://127.0.0.1:8787/health | \
+  jq '.dependencies | to_entries[] | select(.value.ready == false)'
+
+# Delivery backlog depth
+curl -s http://127.0.0.1:8787/health | jq '.dependencies.delivery.ready'
 ```
 
 ```bash
@@ -233,6 +303,10 @@ mimir_telegram_consecutive_failures{network="testnet"} 0
 # HELP mimir_telegram_latest_ledger Highest ledger seen by the poller
 # TYPE mimir_telegram_latest_ledger gauge
 mimir_telegram_latest_ledger{network="testnet"} 5123456
+# HELP mimir_telegram_metric_samples_dropped_total Metric samples dropped before exposition, by bounded reason (invalid_number, unknown_label)
+# TYPE mimir_telegram_metric_samples_dropped_total counter
+mimir_telegram_metric_samples_dropped_total{network="testnet",reason="invalid_number"} 0
+mimir_telegram_metric_samples_dropped_total{network="testnet",reason="unknown_label"} 0
 
 # HELP mimir_telegram_target_last_event_ledger Highest ledger in which an event was processed for a target
 # TYPE mimir_telegram_target_last_event_ledger gauge
@@ -243,6 +317,15 @@ mimir_telegram_target_last_event_ledger{network="testnet",source="squad",contrac
 The `mimir_telegram_latest_ledger` and `mimir_telegram_target_last_event_ledger`
 lines are omitted when no ledger has been observed yet (cold start or no
 events seen).
+
+`GET /metrics` also emits `mimir_telegram_rpc_request_latency_ms` (`_bucket`,
+`_sum`, `_count`): a Prometheus histogram of timed RPC awaits (`getEvents` pages
+and a `getHealth` probe when the scan performs one), in milliseconds. Bounds are
+fixed (`5`, `10`, `25`, `50`, `100`, `250`, `500`, `1_000`, `5_000`, `15_000`,
+plus `+Inf`) and the only series labels are `network`, the constant
+`provider="soroban-rpc"`, and a bounded `operation` (`health`, `events`,
+`other`). `STELLAR_RPC_URL` — including any query string or host — is never a
+label.
 
 ```bash
 curl -s http://127.0.0.1:8787/metrics
@@ -281,6 +364,57 @@ instructions.
 curl -s -o /dev/null -w "%{http_code}" \
   -X POST http://127.0.0.1:8787/telegram-webhook
 ```
+
+---
+
+### `GET /atom` (opt-in, disabled by default)
+
+Read-only [Atom 1.0](https://www.rfc-editor.org/rfc/rfc4287) projection of the
+most recent decoded chain events. It reuses `buildAtomFeed` from
+`src/stellar/feed.ts` and never signs, submits, or mutates chain state.
+
+Enable it with `ATOM_FEED_ENABLED=true`. The route lives on the health listener,
+so it inherits `HEALTH_HOST`, `HEALTH_PORT`, and `HEALTH_AUTH_TOKEN`: a non-loopback
+bind still needs a bearer token, and the same `Authorization: Bearer <token>`
+header is required on this route. `HEALTH_PORT=0` disables the listener and
+therefore the feed.
+
+At most `ATOM_FEED_MAX_ENTRIES` events (default `50`) are retained in memory;
+the oldest are dropped first. Retention is independent of notification delivery,
+so a failed Telegram send does not remove an event from the feed. The feed is a
+best-effort, process-local view — the Stellar ledger remains authoritative and
+the feed makes no exactly-once claim. An empty feed is served before the first
+event arrives, with zero `<entry>` elements.
+
+**Response — 200**, `Content-Type: application/atom+xml; charset=utf-8`
+
+```bash
+curl -s http://127.0.0.1:8787/atom
+```
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title type="text">Mimir Events (testnet)</title>
+  <id>http://127.0.0.1:8787/atom</id>
+  <updated>2026-11-20T12:00:00.000Z</updated>
+  <entry>
+    <title type="text">mimir-market: claim_created</title>
+    <id>tag:mimir,event:Test%20SDF%20Network%20%3B%20September%202015:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB:1234-0</id>
+    <updated>2026-11-20T12:00:00.000Z</updated>
+    <link rel="alternate" type="text/html" href="https://stellar.expert/explorer/testnet/tx/abc"/>
+    <content type="text">Claim #7 created in crypto</content>
+  </entry>
+</feed>
+```
+
+A loopback `http://` self URL is escaped into `<id>` but produces no
+`<link rel="self">` (the builder only emits https self links). Set
+`ATOM_FEED_SELF_URL` to a public https URL when a reverse proxy exposes the feed.
+
+**Response — 404** when `ATOM_FEED_ENABLED` is false.
+**Response — 405** with `Allow: GET` for non-GET methods while enabled.
+**Response — 401** when a bearer token is configured and the request lacks it.
 
 ---
 
@@ -323,6 +457,7 @@ The metrics registry tracks:
 | `mimir_bot_notifications_failed_total` | counter | Telegram sends that threw (cursor still advanced) |
 | `mimir_bot_stale_cursor_events_total` | counter | Times a stale-cursor warning was emitted |
 | `mimir_bot_consecutive_failures` | gauge | Current consecutive full-cycle RPC failures (resets on success) |
+| `mimir_bot_rpc_request_latency_ms` | histogram | Fixed-bucket RPC latency in ms by bounded operation class and constant `provider="soroban-rpc"`; no URL or query-string labels |
 
 ```bash
 METRICS_PORT=9090  # in .env or environment
@@ -373,7 +508,10 @@ methods (`Allow: GET` header set).
 | Health | GET | `/health/live` | 200 | Liveness only (no poller state) |
 | Health | GET | `/livez` | 200 | Alias for `/health/live` |
 | Health | GET | `/metrics` | 200 | Prometheus text (poller-level) |
+| Health | GET | `/atom` | 200, 401, 404 | Bounded read-only Atom feed (`ATOM_FEED_ENABLED` only) |
+| Health | non-GET | `/atom` | 401, 405 | Read-only: `Allow: GET` when enabled |
 | Health | POST | `/telegram-webhook` | 200, 401, 404 | Webhook updates (webhook mode only) |
+| Health | non-GET | `/`, `/health`, `/healthz`, `/health/live`, `/livez`, `/metrics` | 405 | Method not allowed (`Allow: GET`) |
 | Health | GET | `<other>` | 404 | — |
 | Metrics | GET | `/metrics` | 200 | Prometheus text (registry-level) |
 | Metrics | GET | `/health` | 200 | Plain-text liveness |
@@ -389,7 +527,9 @@ methods (`Allow: GET` header set).
 | `HEALTH_HOST` | `127.0.0.1` | Bind address for the health server |
 | `HEALTH_PORT` | `8787` (or `PORT` if set by platform) | TCP port; `0` disables the listener |
 | `HEALTH_STALE_MS` | `90000` | `/health` returns 503 if no successful poll within this window |
-| `HEALTH_AUTH_TOKEN` | _(unset — auth disabled)_ | Bearer token required for every health-server route; headers over 4096 UTF-8 bytes get the same empty 401 as malformed values |
+| `ATOM_FEED_ENABLED` | `false` | Enables the read-only `GET /atom` route on the health listener |
+| `ATOM_FEED_MAX_ENTRIES` | `50` | Maximum decoded events retained for the feed (minimum 1) |
+| `ATOM_FEED_SELF_URL` | _(unset)_ | Optional public https URL used as the feed's `<link rel="self">` |
 | `METRICS_PORT` | _(unset — disabled)_ | TCP port for the separate metrics server; omit to disable |
 
 See [configuration-reference.md](configuration-reference.md) for all

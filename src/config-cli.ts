@@ -23,6 +23,7 @@ import {
 } from "./config.js";
 import { EXIT_ERROR, EXIT_OK } from "./exitCodes.js";
 import { REDACTED, redactText, redactUrl, registerSecrets } from "./redact.js";
+import { DEFAULT_MAX_RESPONSE_BYTES } from "./stellar/rpc-guard.js";
 
 export const KNOWN_CONFIG_KEYS: ReadonlySet<string> = new Set([
   "MIMIR_PROFILE",
@@ -32,6 +33,7 @@ export const KNOWN_CONFIG_KEYS: ReadonlySet<string> = new Set([
   "SQUAD_CONTRACT_VERSION",
   "STELLAR_NETWORK",
   "STELLAR_RPC_URL",
+  "STELLAR_RPC_MAX_RESPONSE_BYTES",
   "STELLAR_HORIZON_URL",
   "STELLAR_NETWORK_PASSPHRASE",
   "STELLAR_EXPLORER_BASE_URL",
@@ -68,6 +70,9 @@ export const KNOWN_CONFIG_KEYS: ReadonlySet<string> = new Set([
   "HEALTH_PORT",
   "PORT",
   "HEALTH_STALE_MS",
+  "ATOM_FEED_ENABLED",
+  "ATOM_FEED_MAX_ENTRIES",
+  "ATOM_FEED_SELF_URL",
   "STARTUP_HEALTH_DEADLINE_MS",
   "STARTUP_HEALTH_RETRY_MS",
   "SHUTDOWN_TIMEOUT_MS",
@@ -77,6 +82,9 @@ export const KNOWN_CONFIG_KEYS: ReadonlySet<string> = new Set([
   "LINK_PREVIEW_SQUAD",
   "LOG_LEVEL",
   "LOG_FORMAT",
+  "LOG_FILE",
+  "LOG_FILE_MAX_BYTES",
+  "LOG_FILE_MAX_FILES",
   "LOG_SAMPLE_MAX_PER_WINDOW",
   "LOG_SAMPLE_WINDOW_MS",
   "LOG_BUFFER_LINES",
@@ -180,6 +188,8 @@ function resolveSettingValue(
       return config.squadContractId;
     case "STELLAR_RPC_URL":
       return redactUrl(config.rpcUrl);
+    case "STELLAR_RPC_MAX_RESPONSE_BYTES":
+      return String(config.rpcMaxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES);
     case "STELLAR_HORIZON_URL":
       return redactUrl(config.horizonUrl);
     case "STELLAR_NETWORK_PASSPHRASE":
@@ -208,6 +218,12 @@ function resolveSettingValue(
       return String(config.healthPort);
     case "HEALTH_STALE_MS":
       return String(config.healthStaleMs);
+    case "ATOM_FEED_ENABLED":
+      return String(config.atomFeedEnabled);
+    case "ATOM_FEED_MAX_ENTRIES":
+      return String(config.atomFeedMaxEntries);
+    case "ATOM_FEED_SELF_URL":
+      return config.atomFeedSelfUrl;
     case "SHUTDOWN_TIMEOUT_MS":
       return String(config.shutdownTimeoutMs);
     case "TELEGRAM_SEND_TIMEOUT_MS":

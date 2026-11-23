@@ -15,14 +15,17 @@
  */
 
 import type { CommandContext, Context } from "grammy";
-import type { UserFromGetMe } from "grammy/types";
+import type { BotCommand, UserFromGetMe } from "grammy/types";
 
 import type { AuditLog } from "../audit.js";
 import type { BotConfig } from "../config.js";
 import { COMMAND_DESCRIPTIONS, messagesFor } from "../i18n.js";
 import type { LogCapture } from "../logger.js";
 import type { PollerPauseResult, PollerResumeResult, PollerStatus } from "../poller.js";
+import type { FollowStore } from "../subscriptions/store.js";
 import type { BroadcastStore } from "./broadcast.js";
+import type { FollowStore } from "../subscriptions/store.js";
+import type { PendingDigestWindow } from "../notifications/digest-preview.js";
 
 /** Everything a command handler may need, supplied once by `createBot`. */
 export interface CommandDeps {
@@ -45,6 +48,18 @@ export interface CommandDeps {
   logs?: LogCapture | undefined;
   /** In-memory broadcast confirmation store. */
   broadcastStore?: BroadcastStore | undefined;
+  /**
+   * Follow store for subscription data. When provided, the operator can use
+   * `/matchpreview` to count how many chats follow a given event reference.
+   * Absent means that command reports zero matches.
+   */
+  follows?: FollowStore | undefined;
+  /**
+   * Optional read-only view of the current pending digest window backing
+   * `/digestpreview`. Absent means `/digestpreview` reports that no pending
+   * digest window is configured.
+   */
+  digestWindow?: PendingDigestWindow | undefined;
 }
 
 /** A slash command handler: grammy's command context plus the bot's deps. */
@@ -52,6 +67,21 @@ export type CommandHandler = (
   ctx: CommandContext<Context>,
   deps: CommandDeps,
 ) => Promise<void>;
+
+/** Result of checking whether a command's optional runtime dependencies are satisfied. */
+export interface CommandAvailabilityCheckResult {
+  readonly available: boolean;
+  /** Human-readable explanation when `available` is false. */
+  readonly reason?: string;
+}
+
+/**
+ * Runtime availability predicate for a command that depends on an optional
+ * data source or capability (e.g. log ring, audit log, broadcast store).
+ */
+export type CommandAvailabilityCheck = (
+  deps?: Partial<CommandDeps>,
+) => CommandAvailabilityCheckResult;
 
 /** One self-contained slash command. */
 export interface CommandModule {
@@ -62,9 +92,11 @@ export interface CommandModule {
    */
   readonly command: string;
   /**
-   * Operator-only commands answer only the configured operator and are hidden
-   * from the menu when no operator is configured. Non-operators are ignored
-   * silently: an error reply would confirm the command exists.
+   * Operator-only commands answer only the configured operator. They are kept
+   * out of the default Telegram menu and advertised only in the operator's
+   * private chat; with no operator configured they are omitted entirely.
+   * Non-operators are ignored silently: an error reply would confirm the
+   * command exists, and a cached Telegram menu is never an authorization gate.
    */
   readonly operatorOnly?: boolean;
   /**
@@ -77,6 +109,12 @@ export interface CommandModule {
    * `/help` (e.g. `/export`, an operator recovery tool).
    */
   readonly hidden?: boolean;
+  /**
+   * Optional runtime dependency check. When it reports `available: false`, the
+   * command is excluded from the public menu (when deps are supplied) and
+   * included with its reason in {@link commandAvailabilityReport}.
+   */
+  readonly availability?: CommandAvailabilityCheck;
   readonly handler: CommandHandler;
 }
 
@@ -85,6 +123,23 @@ export interface CommandMetadata {
   readonly command: string;
   readonly description: string;
   readonly operatorOnly: boolean;
+}
+
+/** Availability status for a single registered command. */
+export interface CommandAvailabilityEntry {
+  readonly command: string;
+  readonly available: boolean;
+  readonly hidden: boolean;
+  readonly operatorOnly: boolean;
+  /** Explains why the command is disabled when `available` is false. */
+  readonly reason?: string;
+}
+
+/** Summary report of command availability for a set of runtime dependencies. */
+export interface CommandAvailabilityReport {
+  readonly entries: readonly CommandAvailabilityEntry[];
+  readonly available: readonly CommandAvailabilityEntry[];
+  readonly unavailable: readonly CommandAvailabilityEntry[];
 }
 
 const registered = new Map<string, CommandModule>();
@@ -140,17 +195,96 @@ export function commandMetadata(): CommandMetadata[] {
     }));
 }
 
+const DEFAULT_UNAVAILABLE_REASON = "Required runtime dependency is not configured.";
+
+function evaluateAvailability(
+  module: CommandModule,
+  deps?: Partial<CommandDeps>,
+): CommandAvailabilityEntry {
+  const hidden = module.hidden === true;
+  const operatorOnly = module.operatorOnly === true;
+
+  if (operatorOnly && deps?.config?.operatorTelegramUserId === null) {
+    return {
+      command: module.command,
+      available: false,
+      hidden,
+      operatorOnly,
+      reason: "No operator is configured (OPERATOR_TELEGRAM_USER_ID is unset).",
+    };
+  }
+
+  if (module.availability !== undefined) {
+    const result = module.availability(deps);
+    if (!result.available) {
+      const reason = result.reason?.trim() || DEFAULT_UNAVAILABLE_REASON;
+      return {
+        command: module.command,
+        available: false,
+        hidden,
+        operatorOnly,
+        reason,
+      };
+    }
+  }
+
+  return {
+    command: module.command,
+    available: true,
+    hidden,
+    operatorOnly,
+  };
+}
+
 /**
- * Commands to advertise to this deployment: localized descriptions, and
- * operator-only entries only when an operator is configured (there is no one
- * to run them otherwise).
+ * Report command availability for the supplied runtime dependencies, explaining
+ * why each disabled command cannot run when its optional data source is absent.
  */
-export function visibleCommandMetadata(config?: BotConfig): CommandMetadata[] {
+export function commandAvailabilityReport(
+  deps?: Partial<CommandDeps>,
+): CommandAvailabilityReport {
+  const entries = registeredCommands().map((module) => evaluateAvailability(module, deps));
+  return {
+    entries,
+    available: entries.filter((entry) => entry.available),
+    unavailable: entries.filter((entry) => !entry.available),
+  };
+}
+
+/** Render a concise human-readable summary of a {@link CommandAvailabilityReport}. */
+export function formatCommandAvailabilityReport(report: CommandAvailabilityReport): string {
+  const header = `Command availability: ${report.available.length} available, ${report.unavailable.length} disabled`;
+  if (report.unavailable.length === 0) {
+    return header;
+  }
+  const disabledLines = report.unavailable.map(
+    (entry) => `- /${entry.command}: ${entry.reason ?? DEFAULT_UNAVAILABLE_REASON}`,
+  );
+  return [header, "Disabled:", ...disabledLines].join("\n");
+}
+
+/**
+ * Commands to advertise to this deployment: localized descriptions, operator-only
+ * entries only when an operator is configured, and — when `deps` is supplied —
+ * only commands whose optional runtime dependencies are available.
+ */
+export function visibleCommandMetadata(
+  config?: BotConfig,
+  deps?: Partial<CommandDeps>,
+): CommandMetadata[] {
   const descriptions = messagesFor(config?.locale).commandDescriptions;
   const operatorConfigured = config === undefined || config.operatorTelegramUserId !== null;
+  const effectiveDeps: Partial<CommandDeps> | undefined =
+    deps !== undefined ? (config !== undefined ? { config, ...deps } : deps) : undefined;
   return registeredCommands()
     .filter((module) => module.hidden !== true)
     .filter((module) => operatorConfigured || module.operatorOnly !== true)
+    .filter((module) => {
+      if (effectiveDeps === undefined || module.availability === undefined) {
+        return true;
+      }
+      return module.availability(effectiveDeps).available;
+    })
     .map((module) => ({
       command: module.command,
       description:
@@ -158,4 +292,46 @@ export function visibleCommandMetadata(config?: BotConfig): CommandMetadata[] {
         descriptionFor(module.command),
       operatorOnly: module.operatorOnly === true,
     }));
+}
+
+/** One Telegram `setMyCommands` payload and the scope where it should apply. */
+export interface CommandMenu {
+  /** Commands to advertise, in registration (menu) order. */
+  readonly commands: readonly BotCommand[];
+  /** Absent means Telegram's default scope: every chat that has not got a narrower menu. */
+  readonly scope?: {
+    readonly type: "chat";
+    /** `OPERATOR_TELEGRAM_USER_ID`; a user's private chat id is their user id. */
+    readonly chat_id: string;
+  };
+}
+
+/**
+ * Build the menus `registerCommands` sends to Telegram.
+ *
+ * The default menu deliberately excludes operator-only commands: Telegram
+ * caches menus per chat and may keep showing them after configuration changes,
+ * so a menu entry is advertising, not authorization. When an operator is
+ * configured, the full menu is registered for that operator's private chat so
+ * they keep every command they can already run. Runtime gates in `src/bot.ts`
+ * continue to decide who may actually execute a command.
+ */
+export function commandMenus(config?: BotConfig): readonly CommandMenu[] {
+  const visible = visibleCommandMetadata(config);
+  const telegramCommands = (items: readonly CommandMetadata[]): readonly BotCommand[] =>
+    items.map(({ command, description }) => ({ command, description }));
+
+  const menus: CommandMenu[] = [
+    { commands: telegramCommands(visible.filter(({ operatorOnly }) => !operatorOnly)) },
+  ];
+
+  const operatorChatId = config?.operatorTelegramUserId;
+  if (operatorChatId !== null && operatorChatId !== undefined && operatorChatId.length > 0) {
+    menus.push({
+      commands: telegramCommands(visible),
+      scope: { type: "chat", chat_id: operatorChatId },
+    });
+  }
+
+  return menus;
 }
